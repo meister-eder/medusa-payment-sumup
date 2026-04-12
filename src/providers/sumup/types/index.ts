@@ -4,7 +4,7 @@
 export type SumUpProviderOptions = {
   /** SumUp API key (e.g. sup_sk_...) */
   apiKey: string;
-  /** SumUp merchant code (e.g. "MH4H92C7") */
+  /** SumUp merchant code (e.g. "MXXXXXXX") */
   merchantCode: string;
   /** The URL of the Medusa backend (e.g. "https://your-medusa.com") */
   medusaUrl: string;

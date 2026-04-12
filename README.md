@@ -75,7 +75,7 @@ modules: [
 | Option | Description | Required | Default |
 |---|---|---|---|
 | `apiKey` | Your SumUp API key (e.g. `sup_sk_...`) | ✅ | — |
-| `merchantCode` | Your SumUp merchant code (e.g. `MH4H92C7`) | ✅ | — |
+| `merchantCode` | Your SumUp merchant code (e.g. `MXXXXXXX`) | ✅ | — |
 | `medusaUrl` | The public URL of your Medusa backend | ✅ | — |
 | `redirectUrl` | The storefront URL to redirect the customer to after payment | ✅ | — |
 | `debug` | Enable verbose debug logging | ❌ | `false` |
@@ -86,7 +86,7 @@ Add the following to your `.env` file:
 
 ```env
 SUMUP_API_KEY=sup_sk_your_api_key
-SUMUP_MERCHANT_CODE=MH4H92C7
+SUMUP_MERCHANT_CODE=YOUR_MERCHANT_CODE
 MEDUSA_BACKEND_URL=https://your-medusa-server.com
 SUMUP_REDIRECT_URL=https://your-store.com/checkout/payment
 ```

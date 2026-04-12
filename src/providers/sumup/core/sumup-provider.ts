@@ -31,11 +31,15 @@ import {
   UpdatePaymentOutput,
 } from "@medusajs/types";
 import { SumUpClient } from "./sumup-client";
+import { SumUpClientError } from "../types";
 import type { SumUpCheckoutStatus, SumUpProviderOptions } from "../types";
 
 type InjectedDependencies = {
   logger: Logger;
 };
+
+// ISO-4217: 3 uppercase alpha characters.
+const CURRENCY_RE = /^[A-Z]{3}$/;
 
 const SUMUP_STATUS_MAP: Record<SumUpCheckoutStatus, PaymentSessionStatus> = {
   PENDING: PaymentSessionStatus.PENDING,
@@ -91,13 +95,113 @@ class SumUpProviderService extends AbstractPaymentProvider {
     this.client_ = new SumUpClient(options);
   }
 
+  // ── Input validators ──────────────────────────────────────────────────────
+
+  /**
+   * Asserts that `amount` is a positive finite number and returns it as a
+   * parsed float.  Throws INVALID_DATA otherwise.
+   */
+  private static assertAmount(amount: unknown, ctx: string): number {
+    const n = parseFloat(String(amount));
+    if (!Number.isFinite(n) || n <= 0) {
+      throw new MedusaError(
+        MedusaError.Types.INVALID_DATA,
+        `${ctx}: amount must be a positive finite number, got "${amount}"`,
+      );
+    }
+    return n;
+  }
+
+  /**
+   * Asserts that `code` is a valid ISO-4217 format (3 alpha chars), normalises
+   * to uppercase, and returns it.  Throws INVALID_DATA otherwise.
+   */
+  private static assertCurrency(code: unknown, ctx: string): string {
+    const upper =
+      typeof code === "string" ? code.toUpperCase().trim() : "";
+    if (!CURRENCY_RE.test(upper)) {
+      throw new MedusaError(
+        MedusaError.Types.INVALID_DATA,
+        `${ctx}: currency_code must be a 3-letter ISO-4217 code, got "${code}"`,
+      );
+    }
+    return upper;
+  }
+
+  /**
+   * Asserts that `id` is a non-empty string and returns it trimmed.
+   * Throws INVALID_DATA otherwise.
+   */
+  private static assertExternalId(id: unknown, ctx: string): string {
+    if (typeof id !== "string" || id.trim() === "") {
+      throw new MedusaError(
+        MedusaError.Types.INVALID_DATA,
+        `${ctx}: checkout ID is required`,
+      );
+    }
+    return id.trim();
+  }
+
+  /**
+   * Translates a SumUpClientError into the most appropriate MedusaError type
+   * so callers receive structured, actionable errors rather than raw HTTP
+   * status text.  Always throws.
+   */
+  private rethrowAsMedusaError(error: unknown, ctx: string): never {
+    if (error instanceof SumUpClientError) {
+      switch (error.type) {
+        case "auth":
+          throw new MedusaError(
+            MedusaError.Types.UNAUTHORIZED,
+            `SumUp authentication failed in ${ctx}. Verify your API key.`,
+          );
+        case "not_found":
+          throw new MedusaError(
+            MedusaError.Types.NOT_FOUND,
+            `SumUp resource not found in ${ctx}.`,
+          );
+        case "validation":
+          throw new MedusaError(
+            MedusaError.Types.INVALID_DATA,
+            `SumUp rejected the request in ${ctx}: ${error.message}`,
+          );
+        case "conflict":
+          throw new MedusaError(
+            MedusaError.Types.CONFLICT,
+            `SumUp conflict in ${ctx}: ${error.message}`,
+          );
+        case "rate_limit":
+          throw new MedusaError(
+            MedusaError.Types.UNEXPECTED_STATE,
+            `SumUp rate limit exceeded in ${ctx}. Please retry later.`,
+          );
+        // network / timeout / server: re-throw as-is with a clear prefix
+        default: {
+          const wrapped = new Error(
+            `SumUp ${error.type} error in ${ctx}: ${error.message}`,
+          );
+          throw wrapped;
+        }
+      }
+    }
+    throw error;
+  }
+
   /**
    * Creates a new SumUp checkout for the payment session.
    */
   async initiatePayment(
     input: InitiatePaymentInput,
   ): Promise<InitiatePaymentOutput> {
-    const { context, amount, currency_code } = input;
+    const ctx = "initiatePayment";
+    // ── Input validation ────────────────────────────────────────────
+    const amount = SumUpProviderService.assertAmount(input.amount, ctx);
+    const currency = SumUpProviderService.assertCurrency(
+      input.currency_code,
+      ctx,
+    );
+
+    const { context } = input;
     try {
       const checkoutReference =
         (input.data?.session_id as string) ?? crypto.randomUUID();
@@ -132,8 +236,8 @@ class SumUpProviderService extends AbstractPaymentProvider {
 
       const checkout = await this.client_.createCheckout({
         checkout_reference: checkoutReference,
-        amount: parseFloat(amount.toString()),
-        currency: currency_code.toUpperCase(),
+        amount,
+        currency,
         merchant_code: this.options_.merchantCode,
         description:
           (input.data?.description as string) || "SumUp payment via Medusa",
@@ -144,7 +248,7 @@ class SumUpProviderService extends AbstractPaymentProvider {
 
       this.debug_ &&
         this.logger_.info(
-          `SumUp checkout ${checkout.id} created with amount ${amount} ${currency_code.toUpperCase()}`,
+          `SumUp checkout ${checkout.id} created with amount ${amount} ${currency}`,
         );
 
       return {
@@ -156,10 +260,8 @@ class SumUpProviderService extends AbstractPaymentProvider {
         },
       };
     } catch (error: any) {
-      this.logger_.error(
-        `Error initiating SumUp payment: ${error.message}`,
-      );
-      throw error;
+      this.logger_.error(`Error in ${ctx}: ${error.message}`);
+      this.rethrowAsMedusaError(error, ctx);
     }
   }
 
@@ -171,14 +273,11 @@ class SumUpProviderService extends AbstractPaymentProvider {
   async authorizePayment(
     input: AuthorizePaymentInput,
   ): Promise<AuthorizePaymentOutput> {
-    const externalId = input.data?.id as string;
-
-    if (!externalId) {
-      throw new MedusaError(
-        MedusaError.Types.INVALID_DATA,
-        "Checkout ID is required",
-      );
-    }
+    const ctx = "authorizePayment";
+    const externalId = SumUpProviderService.assertExternalId(
+      input.data?.id,
+      ctx,
+    );
 
     try {
       const checkout = await this.client_.getCheckout(externalId);
@@ -225,6 +324,9 @@ class SumUpProviderService extends AbstractPaymentProvider {
           };
 
         default:
+          this.logger_.warn(
+            `SumUp payment ${externalId} returned unknown status "${sumupStatus}" — treating as PENDING`,
+          );
           return {
             data: input.data as Record<string, unknown>,
             status: PaymentSessionStatus.PENDING,
@@ -232,9 +334,9 @@ class SumUpProviderService extends AbstractPaymentProvider {
       }
     } catch (error: any) {
       this.logger_.error(
-        `Error authorizing SumUp payment ${externalId}: ${error.message}`,
+        `Error in ${ctx} for ${externalId}: ${error.message}`,
       );
-      throw error;
+      this.rethrowAsMedusaError(error, ctx);
     }
   }
 
@@ -244,14 +346,11 @@ class SumUpProviderService extends AbstractPaymentProvider {
   async capturePayment(
     input: CapturePaymentInput,
   ): Promise<CapturePaymentOutput> {
-    const externalId = input.data?.id as string;
-
-    if (!externalId) {
-      throw new MedusaError(
-        MedusaError.Types.INVALID_DATA,
-        "Checkout ID is required",
-      );
-    }
+    const ctx = "capturePayment";
+    const externalId = SumUpProviderService.assertExternalId(
+      input.data?.id,
+      ctx,
+    );
 
     try {
       const checkout = await this.client_.getCheckout(externalId);
@@ -263,7 +362,19 @@ class SumUpProviderService extends AbstractPaymentProvider {
         );
       }
 
-      const transaction = checkout.transactions?.[0];
+      const transactions = checkout.transactions ?? [];
+
+      if (transactions.length === 0) {
+        // PAID but no transactions array — log a warning and proceed;
+        // SumUp sometimes omits this on freshly completed checkouts.
+        this.logger_.warn(
+          `SumUp checkout ${externalId} is PAID but has no transactions array. ` +
+            "transaction_id will not be available.",
+        );
+        return { data: { ...input.data } as Record<string, unknown> };
+      }
+
+      const transaction = transactions[0];
 
       this.debug_ &&
         this.logger_.info(`SumUp payment ${externalId} capture confirmed`);
@@ -271,15 +382,13 @@ class SumUpProviderService extends AbstractPaymentProvider {
       return {
         data: {
           ...input.data,
-          transaction_id: transaction?.id,
-          transaction_code: transaction?.transaction_code,
+          transaction_id: transaction.id,
+          transaction_code: transaction.transaction_code,
         } as Record<string, unknown>,
       };
     } catch (error: any) {
-      this.logger_.error(
-        `Error capturing SumUp payment ${externalId}: ${error.message}`,
-      );
-      throw error;
+      this.logger_.error(`Error in ${ctx} for ${externalId}: ${error.message}`);
+      this.rethrowAsMedusaError(error, ctx);
     }
   }
 
@@ -289,30 +398,68 @@ class SumUpProviderService extends AbstractPaymentProvider {
   async refundPayment(
     input: RefundPaymentInput,
   ): Promise<RefundPaymentOutput> {
+    const ctx = "refundPayment";
+    // Validate refund amount first — before any API call.
+    const refundAmount = SumUpProviderService.assertAmount(input.amount, ctx);
+
     const transactionId = input.data?.transaction_id as string;
 
     if (!transactionId) {
       // If we don't have transaction_id yet, try to get it from the checkout
       const externalId = input.data?.id as string;
       if (externalId) {
-        const checkout = await this.client_.getCheckout(externalId);
-        const txn = checkout.transactions?.[0];
-        if (txn?.id) {
-          const refundAmount = parseFloat(input.amount.toString());
-          await this.client_.refundTransaction(txn.id, refundAmount);
-
-          this.debug_ &&
-            this.logger_.info(
-              `SumUp refund for payment ${externalId} created with amount ${refundAmount}`,
-            );
-
-          return {
-            data: {
-              ...input.data,
-              transaction_id: txn.id,
-            } as Record<string, unknown>,
-          };
+        let checkout;
+        try {
+          checkout = await this.client_.getCheckout(externalId);
+        } catch (error: any) {
+          this.logger_.error(
+            `Error in ${ctx} looking up checkout ${externalId}: ${error.message}`,
+          );
+          this.rethrowAsMedusaError(error, ctx);
         }
+
+        const transactions = checkout!.transactions ?? [];
+
+        if (transactions.length === 0) {
+          throw new MedusaError(
+            MedusaError.Types.INVALID_DATA,
+            `Cannot refund: checkout ${externalId} has no completed transactions.`,
+          );
+        }
+
+        const txn = transactions[0];
+
+        // Guard against refunding more than was originally captured.
+        if (
+          typeof txn.amount === "number" &&
+          refundAmount > txn.amount
+        ) {
+          throw new MedusaError(
+            MedusaError.Types.INVALID_DATA,
+            `Cannot refund ${refundAmount}: exceeds captured transaction amount of ${txn.amount}.`,
+          );
+        }
+
+        try {
+          await this.client_.refundTransaction(txn.id, refundAmount);
+        } catch (error: any) {
+          this.logger_.error(
+            `Error in ${ctx} refunding transaction ${txn.id}: ${error.message}`,
+          );
+          this.rethrowAsMedusaError(error, ctx);
+        }
+
+        this.debug_ &&
+          this.logger_.info(
+            `SumUp refund for payment ${externalId} created with amount ${refundAmount}`,
+          );
+
+        return {
+          data: {
+            ...input.data,
+            transaction_id: txn.id,
+          } as Record<string, unknown>,
+        };
       }
 
       throw new MedusaError(
@@ -322,7 +469,6 @@ class SumUpProviderService extends AbstractPaymentProvider {
     }
 
     try {
-      const refundAmount = parseFloat(input.amount.toString());
       await this.client_.refundTransaction(transactionId, refundAmount);
 
       this.debug_ &&
@@ -335,9 +481,9 @@ class SumUpProviderService extends AbstractPaymentProvider {
       };
     } catch (error: any) {
       this.logger_.error(
-        `Error refunding SumUp transaction ${transactionId}: ${error.message}`,
+        `Error in ${ctx} for transaction ${transactionId}: ${error.message}`,
       );
-      throw error;
+      this.rethrowAsMedusaError(error, ctx);
     }
   }
 
@@ -393,16 +539,20 @@ class SumUpProviderService extends AbstractPaymentProvider {
   async retrievePayment(
     input: RetrievePaymentInput,
   ): Promise<RetrievePaymentOutput> {
-    const externalId = input.data?.id as string;
+    const ctx = "retrievePayment";
+    const externalId = SumUpProviderService.assertExternalId(
+      input.data?.id,
+      ctx,
+    );
 
     try {
       const data = await this.client_.getCheckout(externalId);
       return { data: data as unknown as Record<string, unknown> };
     } catch (error: any) {
       this.logger_.error(
-        `Error retrieving SumUp payment ${externalId}: ${error.message}`,
+        `Error in ${ctx} for ${externalId}: ${error.message}`,
       );
-      throw error;
+      this.rethrowAsMedusaError(error, ctx);
     }
   }
 
@@ -412,13 +562,23 @@ class SumUpProviderService extends AbstractPaymentProvider {
   async getPaymentStatus(
     input: GetPaymentStatusInput,
   ): Promise<GetPaymentStatusOutput> {
-    const externalId = input.data?.id as string;
+    const ctx = "getPaymentStatus";
+    const externalId = SumUpProviderService.assertExternalId(
+      input.data?.id,
+      ctx,
+    );
 
     try {
       const checkout = await this.client_.getCheckout(externalId);
       const status = checkout.status as SumUpCheckoutStatus;
       const mappedStatus =
         SUMUP_STATUS_MAP[status] ?? PaymentSessionStatus.PENDING;
+
+      if (!SUMUP_STATUS_MAP[status]) {
+        this.logger_.warn(
+          `SumUp checkout ${externalId} returned unknown status "${status}" — defaulting to PENDING`,
+        );
+      }
 
       this.debug_ &&
         this.logger_.debug(
@@ -428,9 +588,9 @@ class SumUpProviderService extends AbstractPaymentProvider {
       return { status: mappedStatus };
     } catch (error: any) {
       this.logger_.error(
-        `Error getting SumUp payment status for ${externalId}: ${error.message}`,
+        `Error in ${ctx} for ${externalId}: ${error.message}`,
       );
-      throw error;
+      this.rethrowAsMedusaError(error, ctx);
     }
   }
 
@@ -441,15 +601,22 @@ class SumUpProviderService extends AbstractPaymentProvider {
   async updatePayment(
     input: UpdatePaymentInput,
   ): Promise<UpdatePaymentOutput> {
-    const externalId = input.data?.id as string;
+    const ctx = "updatePayment";
+    // ── Input validation ────────────────────────────────────────────
+    const amount = SumUpProviderService.assertAmount(input.amount, ctx);
+    const currency = SumUpProviderService.assertCurrency(
+      input.currency_code,
+      ctx,
+    );
+    const externalId = input.data?.id as string | undefined;
 
     try {
-      // Cancel the existing checkout (best-effort)
+      // Cancel the existing checkout (best-effort; may already be expired)
       if (externalId) {
         try {
           await this.client_.deactivateCheckout(externalId);
         } catch {
-          // Ignore — checkout may already be expired or processed
+          // Ignore — checkout may already be in a terminal state
         }
       }
 
@@ -464,8 +631,8 @@ class SumUpProviderService extends AbstractPaymentProvider {
 
       const checkout = await this.client_.createCheckout({
         checkout_reference: checkoutReference,
-        amount: parseFloat(input.amount.toString()),
-        currency: input.currency_code.toUpperCase(),
+        amount,
+        currency,
         merchant_code: this.options_.merchantCode,
         description:
           (input.data?.description as string) ||
@@ -476,7 +643,7 @@ class SumUpProviderService extends AbstractPaymentProvider {
 
       this.debug_ &&
         this.logger_.info(
-          `SumUp checkout updated: old=${externalId} → new=${checkout.id} (amount: ${input.amount} ${input.currency_code.toUpperCase()})`,
+          `SumUp checkout updated: old=${externalId} → new=${checkout.id} (amount: ${amount} ${currency})`,
         );
 
       return {
@@ -488,9 +655,9 @@ class SumUpProviderService extends AbstractPaymentProvider {
       };
     } catch (error: any) {
       this.logger_.error(
-        `Error updating SumUp payment ${externalId}: ${error.message}`,
+        `Error in ${ctx} for ${externalId}: ${error.message}`,
       );
-      throw error;
+      this.rethrowAsMedusaError(error, ctx);
     }
   }
 
@@ -501,18 +668,21 @@ class SumUpProviderService extends AbstractPaymentProvider {
   async getWebhookActionAndData(
     payload: ProviderWebhookPayload["payload"],
   ): Promise<WebhookActionResult> {
+    const ctx = "getWebhookActionAndData";
     const { data } = payload;
 
-    try {
-      // Retrieve checkout from SumUp to verify status (security: never trust webhook body alone)
-      const checkout = await this.client_.getCheckout(data.id as string);
+    // Validate that the payload carries a checkout ID before hitting the API.
+    const checkoutId = data?.id;
+    if (!checkoutId || typeof checkoutId !== "string") {
+      throw new MedusaError(
+        MedusaError.Types.INVALID_DATA,
+        "SumUp webhook payload is missing a checkout ID.",
+      );
+    }
 
-      if (!checkout) {
-        throw new MedusaError(
-          MedusaError.Types.NOT_FOUND,
-          "Checkout not found",
-        );
-      }
+    try {
+      // Always re-verify via the SumUp API — never trust the webhook body alone.
+      const checkout = await this.client_.getCheckout(checkoutId);
 
       const session_id = checkout.checkout_reference;
       const amount = new BigNumber(checkout.amount);
@@ -547,6 +717,9 @@ class SumUpProviderService extends AbstractPaymentProvider {
             data: baseData,
           };
         default:
+          this.logger_.warn(
+            `SumUp webhook: checkout ${checkoutId} has unknown status "${checkout.status}"`,
+          );
           return {
             action: PaymentActions.NOT_SUPPORTED,
             data: baseData,
@@ -554,9 +727,11 @@ class SumUpProviderService extends AbstractPaymentProvider {
       }
     } catch (error: any) {
       this.logger_.error(
-        `Error processing SumUp webhook for checkout ${data.id}: ${error.message}`,
+        `Error in ${ctx} for checkout ${checkoutId}: ${error.message}`,
       );
-      throw error;
+      // Attempt graceful degradation: if we can classify the error (e.g. auth
+      // failure), surface it.  Otherwise re-throw so Medusa can retry.
+      this.rethrowAsMedusaError(error, ctx);
     }
   }
 }

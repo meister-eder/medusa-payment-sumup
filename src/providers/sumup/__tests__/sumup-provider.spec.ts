@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import SumUpProviderService from "../core/sumup-provider";
+import { SumUpClientError } from "../types";
 import type { SumUpCheckout } from "../types";
 
 // Mock the SumUpClient
@@ -332,7 +333,7 @@ describe("SumUpProviderService", () => {
           data: { id: "chk_abc123" },
           amount: 10.0,
         } as any),
-      ).rejects.toThrow("transaction_id");
+      ).rejects.toThrow("no completed transactions");
     });
   });
 
@@ -497,6 +498,398 @@ describe("SumUpProviderService", () => {
       });
 
       expect(result.action).toBe("pending");
+    });
+
+    it("should throw when payload is missing a checkout ID", async () => {
+      const { service } = createService();
+
+      await expect(
+        service.getWebhookActionAndData({
+          data: {},
+          rawData: Buffer.from(""),
+          headers: {},
+        }),
+      ).rejects.toThrow("missing a checkout ID");
+    });
+
+    it("should throw when payload checkout ID is an empty string", async () => {
+      const { service } = createService();
+
+      await expect(
+        service.getWebhookActionAndData({
+          data: { id: "" },
+          rawData: Buffer.from(""),
+          headers: {},
+        }),
+      ).rejects.toThrow("missing a checkout ID");
+    });
+
+    it("should return NOT_SUPPORTED for an unknown SumUp checkout status", async () => {
+      const { service, client } = createService();
+      client.getCheckout.mockResolvedValue(
+        makePaidCheckout({ status: "UNKNOWN_STATUS" as any }),
+      );
+
+      const result = await service.getWebhookActionAndData({
+        data: { id: "chk_abc123" },
+        rawData: Buffer.from(""),
+        headers: {},
+      });
+
+      expect(result.action).toBe("not_supported");
+    });
+  });
+
+  // ── initiatePayment — input validation ────────────────────────────────────
+
+  describe("initiatePayment – input validation", () => {
+    it("should throw for zero amount", async () => {
+      const { service } = createService();
+      await expect(
+        service.initiatePayment({
+          amount: 0,
+          currency_code: "EUR",
+          data: { session_id: "sess_abc" },
+          context: {},
+        } as any),
+      ).rejects.toThrow("positive finite number");
+    });
+
+    it("should throw for negative amount", async () => {
+      const { service } = createService();
+      await expect(
+        service.initiatePayment({
+          amount: -5,
+          currency_code: "EUR",
+          data: { session_id: "sess_abc" },
+          context: {},
+        } as any),
+      ).rejects.toThrow("positive finite number");
+    });
+
+    it("should throw for NaN amount", async () => {
+      const { service } = createService();
+      await expect(
+        service.initiatePayment({
+          amount: NaN,
+          currency_code: "EUR",
+          data: { session_id: "sess_abc" },
+          context: {},
+        } as any),
+      ).rejects.toThrow("positive finite number");
+    });
+
+    it("should throw for Infinity amount", async () => {
+      const { service } = createService();
+      await expect(
+        service.initiatePayment({
+          amount: Infinity,
+          currency_code: "EUR",
+          data: { session_id: "sess_abc" },
+          context: {},
+        } as any),
+      ).rejects.toThrow("positive finite number");
+    });
+
+    it("should throw for empty currency_code", async () => {
+      const { service } = createService();
+      await expect(
+        service.initiatePayment({
+          amount: 10,
+          currency_code: "",
+          data: { session_id: "sess_abc" },
+          context: {},
+        } as any),
+      ).rejects.toThrow("ISO-4217");
+    });
+
+    it("should throw for a currency code that is too short", async () => {
+      const { service } = createService();
+      await expect(
+        service.initiatePayment({
+          amount: 10,
+          currency_code: "EU",
+          data: { session_id: "sess_abc" },
+          context: {},
+        } as any),
+      ).rejects.toThrow("ISO-4217");
+    });
+
+    it("should throw for a currency code that is too long", async () => {
+      const { service } = createService();
+      await expect(
+        service.initiatePayment({
+          amount: 10,
+          currency_code: "EURO",
+          data: { session_id: "sess_abc" },
+          context: {},
+        } as any),
+      ).rejects.toThrow("ISO-4217");
+    });
+
+    it("should normalise a lowercase currency code to uppercase", async () => {
+      const { service, client } = createService();
+      client.createCheckout.mockResolvedValue(
+        makePendingCheckout({ id: "chk_new" }),
+      );
+
+      await service.initiatePayment({
+        amount: 10,
+        currency_code: "eur",
+        data: { session_id: "sess_abc" },
+        context: {},
+      } as any);
+
+      expect(client.createCheckout).toHaveBeenCalledWith(
+        expect.objectContaining({ currency: "EUR" }),
+      );
+    });
+  });
+
+  // ── authorizePayment — edge cases ─────────────────────────────────────────
+
+  describe("authorizePayment – edge cases", () => {
+    it("should throw when checkout ID is missing", async () => {
+      const { service } = createService();
+      await expect(
+        service.authorizePayment({ data: {} } as any),
+      ).rejects.toThrow("checkout ID is required");
+    });
+
+    it("should return pending for an unknown SumUp status and log a warning", async () => {
+      const { service, client } = createService();
+      client.getCheckout.mockResolvedValue(
+        makePaidCheckout({ status: "UNKNOWN" as any }),
+      );
+
+      const result = await service.authorizePayment({
+        data: { id: "chk_abc123" },
+      } as any);
+
+      expect(result.status).toBe("pending");
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("unknown status"),
+      );
+    });
+  });
+
+  // ── capturePayment — edge cases ───────────────────────────────────────────
+
+  describe("capturePayment – edge cases", () => {
+    it("should throw when checkout ID is missing", async () => {
+      const { service } = createService();
+      await expect(
+        service.capturePayment({ data: {} } as any),
+      ).rejects.toThrow("checkout ID is required");
+    });
+
+    it("should return data without transaction_id when transactions array is empty", async () => {
+      const { service, client } = createService();
+      client.getCheckout.mockResolvedValue(
+        makePaidCheckout({ transactions: [] }),
+      );
+
+      const result = await service.capturePayment({
+        data: { id: "chk_abc123" },
+      } as any);
+
+      expect(result.data).not.toHaveProperty("transaction_id");
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("no transactions array"),
+      );
+    });
+  });
+
+  // ── refundPayment — edge cases ────────────────────────────────────────────
+
+  describe("refundPayment – edge cases", () => {
+    it("should throw for zero refund amount", async () => {
+      const { service } = createService();
+      await expect(
+        service.refundPayment({
+          data: { id: "chk_abc123", transaction_id: "txn_001" },
+          amount: 0,
+        } as any),
+      ).rejects.toThrow("positive finite number");
+    });
+
+    it("should throw for negative refund amount", async () => {
+      const { service } = createService();
+      await expect(
+        service.refundPayment({
+          data: { id: "chk_abc123", transaction_id: "txn_001" },
+          amount: -10,
+        } as any),
+      ).rejects.toThrow("positive finite number");
+    });
+
+    it("should throw when refund amount exceeds the captured transaction amount", async () => {
+      const { service, client } = createService();
+      // makePaidCheckout has transaction amount 25.0
+      client.getCheckout.mockResolvedValue(makePaidCheckout());
+
+      await expect(
+        service.refundPayment({
+          data: { id: "chk_abc123" }, // no transaction_id → will fetch checkout
+          amount: 50.0,
+        } as any),
+      ).rejects.toThrow("exceeds captured");
+    });
+
+    it("should throw when neither transaction_id nor checkout id is provided", async () => {
+      const { service } = createService();
+      await expect(
+        service.refundPayment({
+          data: {},
+          amount: 10,
+        } as any),
+      ).rejects.toThrow("no transaction_id");
+    });
+  });
+
+  // ── retrievePayment — edge cases ──────────────────────────────────────────
+
+  describe("retrievePayment – edge cases", () => {
+    it("should throw when checkout ID is missing", async () => {
+      const { service } = createService();
+      await expect(
+        service.retrievePayment({ data: {} } as any),
+      ).rejects.toThrow("checkout ID is required");
+    });
+  });
+
+  // ── getPaymentStatus — edge cases ─────────────────────────────────────────
+
+  describe("getPaymentStatus – edge cases", () => {
+    it("should throw when checkout ID is missing", async () => {
+      const { service } = createService();
+      await expect(
+        service.getPaymentStatus({ data: {} } as any),
+      ).rejects.toThrow("checkout ID is required");
+    });
+
+    it("should return pending and warn for an unknown SumUp status", async () => {
+      const { service, client } = createService();
+      client.getCheckout.mockResolvedValue(
+        makePaidCheckout({ status: "MYSTERY" as any }),
+      );
+
+      const result = await service.getPaymentStatus({
+        data: { id: "chk_abc123" },
+      } as any);
+
+      expect(result.status).toBe("pending");
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("unknown status"),
+      );
+    });
+  });
+
+  // ── updatePayment — input validation ──────────────────────────────────────
+
+  describe("updatePayment – input validation", () => {
+    it("should throw for zero amount", async () => {
+      const { service } = createService();
+      await expect(
+        service.updatePayment({
+          data: { id: "chk_abc123" },
+          amount: 0,
+          currency_code: "EUR",
+          context: {},
+        } as any),
+      ).rejects.toThrow("positive finite number");
+    });
+
+    it("should throw for an invalid currency code", async () => {
+      const { service } = createService();
+      await expect(
+        service.updatePayment({
+          data: { id: "chk_abc123" },
+          amount: 10,
+          currency_code: "INVALID",
+          context: {},
+        } as any),
+      ).rejects.toThrow("ISO-4217");
+    });
+  });
+
+  // ── SumUpClientError → MedusaError translation ────────────────────────────
+
+  describe("SumUpClientError translation", () => {
+    it("should translate auth errors to an UNAUTHORIZED MedusaError", async () => {
+      const { service, client } = createService();
+      client.getCheckout.mockRejectedValue(
+        new SumUpClientError("Unauthorized", "auth", 401),
+      );
+
+      await expect(
+        service.authorizePayment({ data: { id: "chk_abc123" } } as any),
+      ).rejects.toMatchObject({ type: "unauthorized" });
+    });
+
+    it("should translate not_found errors to a NOT_FOUND MedusaError", async () => {
+      const { service, client } = createService();
+      client.getCheckout.mockRejectedValue(
+        new SumUpClientError("Not found", "not_found", 404),
+      );
+
+      await expect(
+        service.retrievePayment({ data: { id: "chk_missing" } } as any),
+      ).rejects.toMatchObject({ type: "not_found" });
+    });
+
+    it("should translate validation errors to an INVALID_DATA MedusaError", async () => {
+      const { service, client } = createService();
+      client.createCheckout.mockRejectedValue(
+        new SumUpClientError("Bad request", "validation", 400),
+      );
+
+      await expect(
+        service.initiatePayment({
+          amount: 10,
+          currency_code: "EUR",
+          data: { session_id: "sess_abc" },
+          context: {},
+        } as any),
+      ).rejects.toMatchObject({ type: "invalid_data" });
+    });
+
+    it("should translate conflict errors to a CONFLICT MedusaError", async () => {
+      const { service, client } = createService();
+      client.createCheckout.mockRejectedValue(
+        new SumUpClientError("Duplicate checkout", "conflict", 409),
+      );
+
+      await expect(
+        service.initiatePayment({
+          amount: 10,
+          currency_code: "EUR",
+          data: { session_id: "sess_abc" },
+          context: {},
+        } as any),
+      ).rejects.toMatchObject({ type: "conflict" });
+    });
+
+    it("should translate rate_limit errors to an UNEXPECTED_STATE MedusaError", async () => {
+      const { service, client } = createService();
+      client.getCheckout.mockRejectedValue(
+        new SumUpClientError("Rate limited", "rate_limit", 429),
+      );
+
+      await expect(
+        service.authorizePayment({ data: { id: "chk_abc123" } } as any),
+      ).rejects.toMatchObject({ type: "unexpected_state" });
+    });
+
+    it("should re-throw server/network errors without translation", async () => {
+      const { service, client } = createService();
+      client.getCheckout.mockRejectedValue(
+        new SumUpClientError("Gateway timeout", "server", 504),
+      );
+
+      await expect(
+        service.authorizePayment({ data: { id: "chk_abc123" } } as any),
+      ).rejects.toThrow("server error");
     });
   });
 });

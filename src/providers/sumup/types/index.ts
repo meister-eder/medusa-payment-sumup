@@ -88,3 +88,40 @@ export interface SumUpProblem {
   detail: string;
   instance?: string;
 }
+
+// ── Typed client error ─────────────────────────────────────────────────────
+
+/**
+ * Error type classification for SumUp API and network failures.
+ * Consumers should branch on `.type` rather than `.message` text.
+ */
+export type SumUpErrorType =
+  | "validation" // 400 / 422
+  | "auth" // 401 / 403
+  | "not_found" // 404
+  | "conflict" // 409
+  | "rate_limit" // 429
+  | "server" // 5xx
+  | "network" // fetch-level failure (DNS, connection refused…)
+  | "timeout"; // AbortSignal.timeout fired
+
+/**
+ * Typed error thrown by SumUpClient for all non-OK HTTP responses and
+ * network-level failures.  Callers can inspect `.type` to decide how to
+ * handle (surface to user, retry, fall through, etc.).
+ */
+export class SumUpClientError extends Error {
+  readonly type: SumUpErrorType;
+  readonly statusCode?: number;
+
+  constructor(
+    message: string,
+    type: SumUpErrorType,
+    statusCode?: number,
+  ) {
+    super(message);
+    this.name = "SumUpClientError";
+    this.type = type;
+    this.statusCode = statusCode;
+  }
+}

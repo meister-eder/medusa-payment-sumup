@@ -1,9 +1,10 @@
 # SumUp Payments for Medusa
 
 A SumUp payment provider plugin for [Medusa](https://medusajs.com/) V2.
+Inspired by https://github.com/VariableVic/mollie-payments-medusa and mostly implemented by Claude.
 
 > [!WARNING]
-> This plugin has not been tested on a live store. Please conduct thorough testing before using it in a production environment. I am not responsible for any missed or failed payments resulting from the use of this plugin. If you encounter any issues, please report them [here](https://github.com/your-username/medusa-payment-sumup/issues).
+> This plugin has not been tested on a live store. Please conduct thorough testing before using it in a production environment. I am not responsible for any missed or failed payments resulting from the use of this plugin. If you encounter any issues, please report them [here](https://github.com/meister-eder/medusa-payment-sumup/issues).
 
 ## Table of Contents
 

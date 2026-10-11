@@ -387,6 +387,25 @@ describe("SumUpProviderService", () => {
       ).rejects.toThrow("already PAID");
       expect(client.deactivateCheckout).not.toHaveBeenCalled();
     });
+
+    it("should NOT throw when deleting a FAILED checkout (storefront session reset)", async () => {
+      const { service, client } = createService();
+      client.getCheckout.mockResolvedValue(
+        makePaidCheckout({ status: "FAILED" }),
+      );
+      // Even if deactivation itself errors, delete must stay best-effort.
+      client.deactivateCheckout.mockRejectedValue(
+        new SumUpClientError("cannot deactivate", "conflict", 409),
+      );
+
+      const result = await service.deletePayment({
+        data: { id: "chk_abc123" },
+      } as any);
+
+      expect(result.data).toEqual(
+        expect.objectContaining({ id: "chk_abc123" }),
+      );
+    });
   });
 
   describe("refundPayment", () => {

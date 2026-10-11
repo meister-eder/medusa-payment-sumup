@@ -89,6 +89,29 @@ override is accepted **only** when its host is the same as `redirectUrl`'s host 
 appears in `redirectUrlAllowedHosts`, and its scheme is `http`/`https`; otherwise
 the checkout is rejected with `INVALID_DATA`. When omitted, `redirectUrl` is used.
 
+> [!IMPORTANT]
+> **The storefront's own origin must be an allowed redirect host.** A typical
+> storefront sends `data.redirect_url = \`${location.origin}/${countryCode}/checkout/complete\``
+> on every payment session. If the storefront's domain is **not** the host of the
+> backend's configured `redirectUrl` **and** is not listed in
+> `redirectUrlAllowedHosts`, **session creation fails and customers cannot pay.**
+>
+> This bites most often when the backend `redirectUrl` env and the storefront
+> domain drift apart between environments (e.g. a `*.sslip.io` or preview deploy,
+> or a separate admin vs. storefront domain). Whenever you add a storefront
+> origin, add it to `redirectUrlAllowedHosts`. Example:
+>
+> ```ts
+> options: {
+>   redirectUrl: "https://shop.example.com/checkout/complete",
+>   redirectUrlAllowedHosts: [
+>     "shop.example.com",
+>     "staging.shop.example.com",
+>     "my-preview.sslip.io",
+>   ],
+> }
+> ```
+
 ### Environment Variables
 
 Add the following to your `.env` file:

@@ -77,8 +77,17 @@ modules: [
 | `apiKey` | Your SumUp API key (e.g. `sup_sk_...`) | ✅ | — |
 | `merchantCode` | Your SumUp merchant code (e.g. `MXXXXXXX`) | ✅ | — |
 | `medusaUrl` | The public URL of your Medusa backend | ✅ | — |
-| `redirectUrl` | The storefront URL to redirect the customer to after payment | ✅ | — |
+| `redirectUrl` | The default storefront URL to redirect the customer to after payment. Must be a valid `http`/`https` URL. | ✅ | — |
+| `redirectUrlAllowedHosts` | Extra hostnames permitted when a payment session supplies its own `data.redirect_url`. The host of `redirectUrl` is always allowed. Any override on a non-allowed host is rejected (open-redirect protection). | ❌ | `[redirectUrl host]` |
 | `debug` | Enable verbose debug logging | ❌ | `false` |
+
+#### Per-session redirect URL
+
+A payment session may override the redirect target by passing `data.redirect_url`
+(e.g. a locale-specific `https://shop.example.com/us/checkout/complete`). The
+override is accepted **only** when its host is the same as `redirectUrl`'s host or
+appears in `redirectUrlAllowedHosts`, and its scheme is `http`/`https`; otherwise
+the checkout is rejected with `INVALID_DATA`. When omitted, `redirectUrl` is used.
 
 ### Environment Variables
 
@@ -115,7 +124,7 @@ Basic flow:
 2. Your storefront receives the checkout `id` from the payment session data
 3. Render the SumUp Card Widget with the checkout ID
 4. SumUp processes the payment and calls the Medusa webhook (`/hooks/payment/sumup_sumup`)
-5. Medusa authorizes and captures the payment automatically
+5. Because SumUp auto-captures, a `PAID` checkout is reported to Medusa as **captured** at authorize time — the order's payment is marked captured immediately on completion, without waiting for the webhook. The webhook (which the plugin always re-verifies against the SumUp API, since SumUp webhooks are unsigned) acts as a backstop that reconciles status if the browser flow is interrupted.
 
 Example Card Widget integration:
 

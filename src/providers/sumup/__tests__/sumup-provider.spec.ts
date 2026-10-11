@@ -128,6 +128,28 @@ describe("SumUpProviderService", () => {
         }),
       ).not.toThrow();
     });
+
+    it("should throw for a malformed medusaUrl", () => {
+      expect(() =>
+        SumUpProviderService.validateOptions({
+          apiKey: "sup_sk_test_123",
+          merchantCode: "MC12345",
+          medusaUrl: "not a url",
+          redirectUrl: "https://example.com/checkout",
+        }),
+      ).toThrow("valid absolute URL");
+    });
+
+    it("should throw for a non-http(s) redirectUrl scheme", () => {
+      expect(() =>
+        SumUpProviderService.validateOptions({
+          apiKey: "sup_sk_test_123",
+          merchantCode: "MC12345",
+          medusaUrl: "https://example.com",
+          redirectUrl: "javascript:alert(1)",
+        }),
+      ).toThrow(/http or https|valid absolute URL/);
+    });
   });
 
   describe("initiatePayment", () => {
@@ -167,10 +189,73 @@ describe("SumUpProviderService", () => {
         }),
       );
     });
+
+    it("should honour a per-session redirect_url on an allowed host", async () => {
+      const { service, client } = createService();
+      client.createCheckout.mockResolvedValue(makePendingCheckout());
+
+      await service.initiatePayment({
+        amount: 25.0,
+        currency_code: "eur",
+        data: {
+          session_id: "sess_abc",
+          // same host as the configured redirectUrl (example.com) → allowed
+          redirect_url: "https://example.com/us/checkout/complete",
+        },
+      } as any);
+
+      expect(client.createCheckout).toHaveBeenCalledWith(
+        expect.objectContaining({
+          redirect_url: "https://example.com/us/checkout/complete",
+        }),
+      );
+    });
+
+    it("should reject a per-session redirect_url on a foreign host (open-redirect guard)", async () => {
+      const { service, client } = createService();
+
+      await expect(
+        service.initiatePayment({
+          amount: 25.0,
+          currency_code: "eur",
+          data: {
+            session_id: "sess_abc",
+            redirect_url: "https://evil.example.net/steal",
+          },
+        } as any),
+      ).rejects.toThrow("not allowed");
+      expect(client.createCheckout).not.toHaveBeenCalled();
+    });
+
+    it("should forward guest personal_details to SumUp", async () => {
+      const { service, client } = createService();
+      client.createCheckout.mockResolvedValue(makePendingCheckout());
+
+      await service.initiatePayment({
+        amount: 25.0,
+        currency_code: "eur",
+        data: {
+          session_id: "sess_abc",
+          first_name: "Ada",
+          last_name: "Lovelace",
+          email: "ada@example.com",
+        },
+      } as any);
+
+      expect(client.createCheckout).toHaveBeenCalledWith(
+        expect.objectContaining({
+          personal_details: {
+            first_name: "Ada",
+            last_name: "Lovelace",
+            email: "ada@example.com",
+          },
+        }),
+      );
+    });
   });
 
   describe("authorizePayment", () => {
-    it('should return "authorized" when SumUp checkout is PAID', async () => {
+    it('should return "captured" when SumUp checkout is PAID (auto-capture)', async () => {
       const { service, client } = createService();
       client.getCheckout.mockResolvedValue(makePaidCheckout());
 
@@ -178,7 +263,7 @@ describe("SumUpProviderService", () => {
         data: { id: "chk_abc123" },
       } as any);
 
-      expect(result.status).toBe("authorized");
+      expect(result.status).toBe("captured");
       expect(result.data).toEqual(
         expect.objectContaining({
           id: "chk_abc123",
@@ -290,6 +375,16 @@ describe("SumUpProviderService", () => {
         data: { id: "chk_abc123" },
       } as any);
 
+      expect(client.deactivateCheckout).not.toHaveBeenCalled();
+    });
+
+    it("should refuse to cancel a PAID checkout (requires refund instead)", async () => {
+      const { service, client } = createService();
+      client.getCheckout.mockResolvedValue(makePaidCheckout());
+
+      await expect(
+        service.cancelPayment({ data: { id: "chk_abc123" } } as any),
+      ).rejects.toThrow("already PAID");
       expect(client.deactivateCheckout).not.toHaveBeenCalled();
     });
   });
@@ -414,6 +509,46 @@ describe("SumUpProviderService", () => {
       expect(result.data).toEqual(
         expect.objectContaining({ id: "chk_new456" }),
       );
+    });
+
+    it("should carry personal_details through the recreate", async () => {
+      const { service, client } = createService();
+      client.deactivateCheckout.mockResolvedValue(undefined);
+      client.createCheckout.mockResolvedValue(
+        makePendingCheckout({ id: "chk_new456" }),
+      );
+
+      await service.updatePayment({
+        data: {
+          id: "chk_abc123",
+          session_id: "session_123",
+          first_name: "Ada",
+          email: "ada@example.com",
+        },
+        amount: 30.0,
+        currency_code: "eur",
+      } as any);
+
+      expect(client.createCheckout).toHaveBeenCalledWith(
+        expect.objectContaining({
+          personal_details: { first_name: "Ada", email: "ada@example.com" },
+        }),
+      );
+    });
+
+    it("should refuse to update a checkout that is already PAID", async () => {
+      const { service, client } = createService();
+      client.getCheckout.mockResolvedValue(makePaidCheckout());
+
+      await expect(
+        service.updatePayment({
+          data: { id: "chk_abc123" },
+          amount: 30.0,
+          currency_code: "eur",
+        } as any),
+      ).rejects.toThrow("already PAID");
+      expect(client.deactivateCheckout).not.toHaveBeenCalled();
+      expect(client.createCheckout).not.toHaveBeenCalled();
     });
 
     it("should still create new checkout if deactivation fails", async () => {
@@ -734,6 +869,36 @@ describe("SumUpProviderService", () => {
           amount: 50.0,
         } as any),
       ).rejects.toThrow("exceeds captured");
+    });
+
+    it("should cap the refund even when transaction_id is already in data", async () => {
+      const { service, client } = createService();
+      // transaction_id present AND checkout id present: the cap must still
+      // apply (captured amount is 25.0 from makePaidCheckout).
+      client.getCheckout.mockResolvedValue(makePaidCheckout());
+
+      await expect(
+        service.refundPayment({
+          data: { id: "chk_abc123", transaction_id: "txn_001" },
+          amount: 50.0,
+        } as any),
+      ).rejects.toThrow("exceeds captured");
+      expect(client.refundTransaction).not.toHaveBeenCalled();
+    });
+
+    it("should still refund with a known transaction_id if the checkout lookup fails", async () => {
+      const { service, client } = createService();
+      client.getCheckout.mockRejectedValue(
+        new SumUpClientError("boom", "server", 500),
+      );
+      client.refundTransaction.mockResolvedValue(undefined);
+
+      await service.refundPayment({
+        data: { id: "chk_abc123", transaction_id: "txn_001" },
+        amount: 10.0,
+      } as any);
+
+      expect(client.refundTransaction).toHaveBeenCalledWith("txn_001", 10.0);
     });
 
     it("should throw when neither transaction_id nor checkout id is provided", async () => {

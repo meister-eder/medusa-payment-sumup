@@ -55,6 +55,9 @@ class SumUpProviderService extends AbstractPaymentProvider {
   protected options_: SumUpProviderOptions;
   protected client_: SumUpClient;
   protected debug_: boolean;
+  protected webhookUrl_: string;
+  /** Lower-cased "host:port" origins permitted for per-session redirect overrides. */
+  protected allowedRedirectHosts_: Set<string>;
 
   static validateOptions(options: Record<string, unknown>): void {
     if (!options.apiKey || typeof options.apiKey !== "string") {
@@ -81,6 +84,26 @@ class SumUpProviderService extends AbstractPaymentProvider {
         "Redirect URL (redirectUrl) is required.",
       );
     }
+    // Fail fast on malformed URLs instead of silently building broken
+    // webhook / redirect links at request time.
+    for (const key of ["medusaUrl", "redirectUrl"] as const) {
+      const value = options[key] as string;
+      let parsed: URL;
+      try {
+        parsed = new URL(value);
+      } catch {
+        throw new MedusaError(
+          MedusaError.Types.INVALID_DATA,
+          `SumUp ${key} must be a valid absolute URL, got "${value}".`,
+        );
+      }
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        throw new MedusaError(
+          MedusaError.Types.INVALID_DATA,
+          `SumUp ${key} must use http or https, got "${parsed.protocol}".`,
+        );
+      }
+    }
   }
 
   constructor(container: InjectedDependencies, options: SumUpProviderOptions) {
@@ -93,6 +116,91 @@ class SumUpProviderService extends AbstractPaymentProvider {
       process.env.NODE_ENV === "test" ||
       false;
     this.client_ = new SumUpClient(options);
+    // Strip any trailing slash(es) so we never emit `https://host//hooks/...`,
+    // which can fail to match Medusa's webhook route.
+    this.webhookUrl_ =
+      options.medusaUrl.replace(/\/+$/, "") + "/hooks/payment/sumup_sumup";
+
+    // Build the allow-list for per-session redirect_url overrides. Defaults to
+    // the configured redirectUrl's own host when no explicit list is given.
+    this.allowedRedirectHosts_ = new Set<string>();
+    try {
+      this.allowedRedirectHosts_.add(new URL(options.redirectUrl).host.toLowerCase());
+    } catch {
+      // validateOptions already guarantees a parseable URL; ignore defensively.
+    }
+    for (const host of options.redirectUrlAllowedHosts ?? []) {
+      if (typeof host === "string" && host.trim() !== "") {
+        this.allowedRedirectHosts_.add(host.trim().toLowerCase());
+      }
+    }
+  }
+
+  /**
+   * Resolves the redirect URL for a checkout. If the request supplies
+   * `data.redirect_url`, it is honoured ONLY when its host is in the configured
+   * allow-list; otherwise it is rejected (open-redirect protection). Falls back
+   * to the statically configured redirectUrl when no override is present.
+   */
+  private resolveRedirectUrl(dataRedirect: unknown, ctx: string): string {
+    if (dataRedirect === undefined || dataRedirect === null) {
+      return this.options_.redirectUrl;
+    }
+    if (typeof dataRedirect !== "string" || dataRedirect.trim() === "") {
+      throw new MedusaError(
+        MedusaError.Types.INVALID_DATA,
+        `${ctx}: redirect_url must be a non-empty string when provided.`,
+      );
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(dataRedirect);
+    } catch {
+      throw new MedusaError(
+        MedusaError.Types.INVALID_DATA,
+        `${ctx}: redirect_url is not a valid absolute URL.`,
+      );
+    }
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      throw new MedusaError(
+        MedusaError.Types.INVALID_DATA,
+        `${ctx}: redirect_url must use http or https.`,
+      );
+    }
+    if (!this.allowedRedirectHosts_.has(parsed.host.toLowerCase())) {
+      throw new MedusaError(
+        MedusaError.Types.INVALID_DATA,
+        `${ctx}: redirect_url host "${parsed.host}" is not allowed.`,
+      );
+    }
+    return parsed.toString();
+  }
+
+  /**
+   * Builds SumUp `personal_details` from logged-in customer context, falling
+   * back to guest fields in `data`. Returns undefined when nothing is present.
+   */
+  private static buildPersonalDetails(
+    customer:
+      | {
+          first_name?: string | null;
+          last_name?: string | null;
+          email?: string | null;
+        }
+      | undefined,
+    data: Record<string, unknown> | undefined,
+  ): { first_name?: string; last_name?: string; email?: string } | undefined {
+    const first =
+      customer?.first_name ?? (data?.first_name as string | undefined);
+    const last =
+      customer?.last_name ?? (data?.last_name as string | undefined);
+    const email = customer?.email ?? (data?.email as string | undefined);
+    if (!first && !last && !email) return undefined;
+    return {
+      ...(first && { first_name: first }),
+      ...(last && { last_name: last }),
+      ...(email && { email }),
+    };
   }
 
   // ── Input validators ──────────────────────────────────────────────────────
@@ -102,14 +210,20 @@ class SumUpProviderService extends AbstractPaymentProvider {
    * parsed float.  Throws INVALID_DATA otherwise.
    */
   private static assertAmount(amount: unknown, ctx: string): number {
-    const n = parseFloat(String(amount));
+    // Use Number() (not parseFloat) so partially-numeric junk like "12abc"
+    // is rejected instead of silently becoming 12.
+    const n =
+      typeof amount === "number" ? amount : Number(String(amount).trim());
     if (!Number.isFinite(n) || n <= 0) {
       throw new MedusaError(
         MedusaError.Types.INVALID_DATA,
         `${ctx}: amount must be a positive finite number, got "${amount}"`,
       );
     }
-    return n;
+    // Quantise to 2-decimal minor units so float noise (e.g. 19.990000000002)
+    // is never sent to SumUp or used as a refund cap. SumUp's supported
+    // currencies are all 2-decimal.
+    return Math.round((n + Number.EPSILON) * 100) / 100;
   }
 
   /**
@@ -213,26 +327,16 @@ class SumUpProviderService extends AbstractPaymentProvider {
         );
       }
 
-      const webhookUrl =
-        this.options_.medusaUrl + "/hooks/payment/sumup_sumup";
-
-      const customer = context?.customer;
       // Merge guest data (from cart shipping address) with logged-in customer
       // context; context.customer takes precedence when present.
-      const pdFirst =
-        customer?.first_name ?? (input.data?.first_name as string | undefined);
-      const pdLast =
-        customer?.last_name ?? (input.data?.last_name as string | undefined);
-      const pdEmail =
-        customer?.email ?? (input.data?.email as string | undefined);
-      const personalDetails =
-        pdFirst || pdLast || pdEmail
-          ? {
-              ...(pdFirst && { first_name: pdFirst }),
-              ...(pdLast && { last_name: pdLast }),
-              ...(pdEmail && { email: pdEmail }),
-            }
-          : undefined;
+      const personalDetails = SumUpProviderService.buildPersonalDetails(
+        context?.customer,
+        input.data,
+      );
+      const redirectUrl = this.resolveRedirectUrl(
+        input.data?.redirect_url,
+        ctx,
+      );
 
       const checkout = await this.client_.createCheckout({
         checkout_reference: checkoutReference,
@@ -241,8 +345,8 @@ class SumUpProviderService extends AbstractPaymentProvider {
         merchant_code: this.options_.merchantCode,
         description:
           (input.data?.description as string) || "SumUp payment via Medusa",
-        return_url: webhookUrl,
-        redirect_url: this.options_.redirectUrl,
+        return_url: this.webhookUrl_,
+        redirect_url: redirectUrl,
         ...(personalDetails && { personal_details: personalDetails }),
       });
 
@@ -286,11 +390,14 @@ class SumUpProviderService extends AbstractPaymentProvider {
 
       switch (sumupStatus) {
         case "PAID":
-          // SumUp auto-captures. Return AUTHORIZED so Medusa's
-          // authorize → capture flow proceeds naturally.
+          // SumUp auto-captures: the funds are already taken by the time a
+          // checkout is PAID. Report CAPTURED (not AUTHORIZED) so the order's
+          // payment is marked captured immediately on the storefront path,
+          // without depending on a later webhook. This matches getPaymentStatus,
+          // which also maps PAID → CAPTURED.
           this.debug_ &&
             this.logger_.info(
-              `SumUp payment ${externalId} is PAID — returning AUTHORIZED`,
+              `SumUp payment ${externalId} is PAID — returning CAPTURED`,
             );
           return {
             data: {
@@ -298,7 +405,7 @@ class SumUpProviderService extends AbstractPaymentProvider {
               transaction_id: transaction?.id,
               transaction_code: transaction?.transaction_code,
             } as Record<string, unknown>,
-            status: PaymentSessionStatus.AUTHORIZED,
+            status: PaymentSessionStatus.CAPTURED,
           };
 
         case "PENDING":
@@ -402,73 +509,66 @@ class SumUpProviderService extends AbstractPaymentProvider {
     // Validate refund amount first — before any API call.
     const refundAmount = SumUpProviderService.assertAmount(input.amount, ctx);
 
-    const transactionId = input.data?.transaction_id as string;
+    const externalId = input.data?.id as string | undefined;
+    let transactionId = input.data?.transaction_id as string | undefined;
 
-    if (!transactionId) {
-      // If we don't have transaction_id yet, try to get it from the checkout
-      const externalId = input.data?.id as string;
+    try {
+      // Resolve the authoritative captured transaction from the checkout when
+      // we can. This lets us (a) discover the transaction_id if it isn't in
+      // `data` and (b) cap the refund at the captured amount — on BOTH the
+      // "id already known" and "look it up" paths, not just the latter.
+      let capturedAmount: number | undefined;
+
       if (externalId) {
         let checkout;
         try {
           checkout = await this.client_.getCheckout(externalId);
         } catch (error: any) {
-          this.logger_.error(
-            `Error in ${ctx} looking up checkout ${externalId}: ${error.message}`,
+          // If we already have a transaction_id we can still refund without
+          // the client-side cap (SumUp enforces it server-side). Without one
+          // we cannot proceed.
+          if (!transactionId) {
+            this.logger_.error(
+              `Error in ${ctx} looking up checkout ${externalId}: ${error.message}`,
+            );
+            this.rethrowAsMedusaError(error, ctx);
+          }
+          this.logger_.warn(
+            `Could not look up checkout ${externalId} to cap refund (${error.message}); ` +
+              "proceeding with known transaction_id.",
           );
-          this.rethrowAsMedusaError(error, ctx);
         }
 
-        const transactions = checkout!.transactions ?? [];
-
-        if (transactions.length === 0) {
+        const txn = checkout?.transactions?.[0];
+        if (txn) {
+          transactionId = transactionId ?? txn.id;
+          if (typeof txn.amount === "number") capturedAmount = txn.amount;
+        } else if (!transactionId) {
           throw new MedusaError(
             MedusaError.Types.INVALID_DATA,
             `Cannot refund: checkout ${externalId} has no completed transactions.`,
           );
         }
-
-        const txn = transactions[0];
-
-        // Guard against refunding more than was originally captured.
-        if (
-          typeof txn.amount === "number" &&
-          refundAmount > txn.amount
-        ) {
-          throw new MedusaError(
-            MedusaError.Types.INVALID_DATA,
-            `Cannot refund ${refundAmount}: exceeds captured transaction amount of ${txn.amount}.`,
-          );
-        }
-
-        try {
-          await this.client_.refundTransaction(txn.id, refundAmount);
-        } catch (error: any) {
-          this.logger_.error(
-            `Error in ${ctx} refunding transaction ${txn.id}: ${error.message}`,
-          );
-          this.rethrowAsMedusaError(error, ctx);
-        }
-
-        this.debug_ &&
-          this.logger_.info(
-            `SumUp refund for payment ${externalId} created with amount ${refundAmount}`,
-          );
-
-        return {
-          data: {
-            ...input.data,
-            transaction_id: txn.id,
-          } as Record<string, unknown>,
-        };
       }
 
-      throw new MedusaError(
-        MedusaError.Types.INVALID_DATA,
-        "Cannot refund: no transaction_id found in payment data.",
-      );
-    }
+      if (!transactionId) {
+        throw new MedusaError(
+          MedusaError.Types.INVALID_DATA,
+          "Cannot refund: no transaction_id found in payment data.",
+        );
+      }
 
-    try {
+      // Guard against refunding more than was originally captured.
+      // NOTE: this caps against the original captured amount, not the
+      // remaining refundable balance — prior partial refunds are not
+      // subtracted here (SumUp still enforces the true balance server-side).
+      if (capturedAmount !== undefined && refundAmount > capturedAmount) {
+        throw new MedusaError(
+          MedusaError.Types.INVALID_DATA,
+          `Cannot refund ${refundAmount}: exceeds captured transaction amount of ${capturedAmount}.`,
+        );
+      }
+
       await this.client_.refundTransaction(transactionId, refundAmount);
 
       this.debug_ &&
@@ -477,11 +577,14 @@ class SumUpProviderService extends AbstractPaymentProvider {
         );
 
       return {
-        data: input.data as Record<string, unknown>,
+        data: {
+          ...input.data,
+          transaction_id: transactionId,
+        } as Record<string, unknown>,
       };
     } catch (error: any) {
       this.logger_.error(
-        `Error in ${ctx} for transaction ${transactionId}: ${error.message}`,
+        `Error in ${ctx} for ${transactionId ?? externalId}: ${error.message}`,
       );
       this.rethrowAsMedusaError(error, ctx);
     }
@@ -507,6 +610,20 @@ class SumUpProviderService extends AbstractPaymentProvider {
           return { data: input.data as Record<string, unknown> };
         }
 
+        if (checkout.status === "PAID") {
+          // A PAID checkout has already captured funds and cannot be
+          // deactivated — cancelling it would misrepresent a completed
+          // payment. Surface this clearly; the correct remedy is a refund.
+          this.logger_.warn(
+            `SumUp checkout ${externalId} is already PAID and cannot be cancelled. ` +
+              "Issue a refund instead if the order is being voided.",
+          );
+          throw new MedusaError(
+            MedusaError.Types.NOT_ALLOWED,
+            `Cannot cancel SumUp checkout ${externalId}: it is already PAID. Refund it instead.`,
+          );
+        }
+
         await this.client_.deactivateCheckout(externalId);
       }
 
@@ -517,6 +634,11 @@ class SumUpProviderService extends AbstractPaymentProvider {
         data: input.data as Record<string, unknown>,
       };
     } catch (error: any) {
+      // Deliberate business-rule errors (e.g. "already PAID") must propagate —
+      // only transient/deactivation failures are swallowed as best-effort.
+      if (error instanceof MedusaError) {
+        throw error;
+      }
       this.logger_.warn(
         `Could not cancel SumUp checkout ${externalId}: ${error.message}`,
       );
@@ -611,8 +733,31 @@ class SumUpProviderService extends AbstractPaymentProvider {
     const externalId = input.data?.id as string | undefined;
 
     try {
-      // Cancel the existing checkout (best-effort; may already be expired)
+      // Refuse to recreate over an already-PAID checkout. If the customer paid
+      // the current checkout in the race window just before this update, silently
+      // deactivating it and creating a new payable checkout would orphan the
+      // captured funds (and risk a double charge). Surface a conflict instead.
       if (externalId) {
+        let existing;
+        try {
+          existing = await this.client_.getCheckout(externalId);
+        } catch (error: any) {
+          // Lookup failed (e.g. transient/not_found). Fall back to the
+          // best-effort recreate rather than blocking a legitimate update.
+          this.logger_.warn(
+            `Could not verify checkout ${externalId} status before update (${error.message}); proceeding with recreate.`,
+          );
+        }
+
+        if (existing?.status === "PAID") {
+          throw new MedusaError(
+            MedusaError.Types.CONFLICT,
+            `Cannot update SumUp checkout ${externalId}: it is already PAID. ` +
+              "Refund it before changing the amount.",
+          );
+        }
+
+        // Cancel the existing checkout (best-effort; may already be expired)
         try {
           await this.client_.deactivateCheckout(externalId);
         } catch {
@@ -626,8 +771,16 @@ class SumUpProviderService extends AbstractPaymentProvider {
         (input.data?.checkout_reference as string) ??
         crypto.randomUUID();
 
-      const webhookUrl =
-        this.options_.medusaUrl + "/hooks/payment/sumup_sumup";
+      // Carry personal_details and the (validated) redirect_url across the
+      // recreate so an amount/cart update doesn't silently drop them.
+      const personalDetails = SumUpProviderService.buildPersonalDetails(
+        input.context?.customer,
+        input.data,
+      );
+      const redirectUrl = this.resolveRedirectUrl(
+        input.data?.redirect_url,
+        ctx,
+      );
 
       const checkout = await this.client_.createCheckout({
         checkout_reference: checkoutReference,
@@ -637,8 +790,9 @@ class SumUpProviderService extends AbstractPaymentProvider {
         description:
           (input.data?.description as string) ||
           "SumUp payment via Medusa",
-        return_url: webhookUrl,
-        redirect_url: this.options_.redirectUrl,
+        return_url: this.webhookUrl_,
+        redirect_url: redirectUrl,
+        ...(personalDetails && { personal_details: personalDetails }),
       });
 
       this.debug_ &&
@@ -685,8 +839,23 @@ class SumUpProviderService extends AbstractPaymentProvider {
       const checkout = await this.client_.getCheckout(checkoutId);
 
       const session_id = checkout.checkout_reference;
-      const amount = new BigNumber(checkout.amount);
       const transaction = checkout.transactions?.[0];
+
+      // Guard the amount: BigNumber(undefined/NaN) would throw and abort the
+      // whole webhook. Fall back to the transaction amount, then to 0.
+      const rawAmount =
+        typeof checkout.amount === "number" && Number.isFinite(checkout.amount)
+          ? checkout.amount
+          : typeof transaction?.amount === "number" &&
+              Number.isFinite(transaction.amount)
+            ? transaction.amount
+            : undefined;
+      if (rawAmount === undefined) {
+        this.logger_.warn(
+          `SumUp webhook: checkout ${checkoutId} has no usable amount; defaulting to 0.`,
+        );
+      }
+      const amount = new BigNumber(rawAmount ?? 0);
 
       const baseData = {
         session_id,

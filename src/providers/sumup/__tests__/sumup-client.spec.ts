@@ -213,6 +213,21 @@ describe("SumUpClient", () => {
       expect(calls).toBe(1);
     });
 
+    it("does NOT retry an unexpected non-429 4xx (e.g. 402)", async () => {
+      let calls = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockImplementation(() => {
+          calls += 1;
+          return Promise.resolve(mockResponse(402, "payment required"));
+        }),
+      );
+
+      const err = await client.getCheckout("chk_bad").catch((e) => e);
+      expect(calls).toBe(1);
+      expect(err.type).toBe("validation");
+    });
+
     it("retries a network error and succeeds on the next attempt", async () => {
       let calls = 0;
       const checkoutData = { id: "chk_ok", status: "PENDING" };
@@ -262,6 +277,27 @@ describe("SumUpClient", () => {
 
       expect(result).toMatchObject({ id: "chk_new" });
     });
+
+    it("does NOT retry a POST on a network error (avoids duplicate checkouts)", async () => {
+      let calls = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockImplementation(() => {
+          calls += 1;
+          return Promise.reject(new TypeError("Failed to fetch"));
+        }),
+      );
+
+      await client
+        .createCheckout({
+          checkout_reference: "ref_abc",
+          amount: 25.0,
+          currency: "EUR",
+          merchant_code: "MC12345",
+        })
+        .catch(() => {});
+      expect(calls).toBe(1);
+    });
   });
 
   // ── refundTransaction ─────────────────────────────────────────────────────
@@ -290,6 +326,20 @@ describe("SumUpClient", () => {
         .catch((e) => e);
       expect(err).toBeInstanceOf(SumUpClientError);
       expect(err.type).toBe("validation");
+    });
+
+    it("does NOT retry a refund POST on a 500 (avoids double refunds)", async () => {
+      let calls = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockImplementation(() => {
+          calls += 1;
+          return Promise.resolve(mockResponse(500, "server error"));
+        }),
+      );
+
+      await client.refundTransaction("txn_001", 10.0).catch(() => {});
+      expect(calls).toBe(1);
     });
   });
 });

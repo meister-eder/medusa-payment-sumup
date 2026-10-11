@@ -24,14 +24,29 @@ const SENSITIVE_FIELDS = new Set([
   "secret",
 ]);
 
+/** Recursively drop sensitive keys from a parsed value (objects + arrays). */
+function redactValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactValue);
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+      if (SENSITIVE_FIELDS.has(key.toLowerCase())) continue;
+      out[key] = redactValue(val);
+    }
+    return out;
+  }
+  return value;
+}
+
 /** Strips sensitive keys from a JSON error body before it appears in error messages. */
 function redactErrorBody(text: string): string {
   try {
-    const obj = JSON.parse(text) as Record<string, unknown>;
-    for (const key of SENSITIVE_FIELDS) {
-      delete obj[key];
-    }
-    return JSON.stringify(obj);
+    const redacted = redactValue(JSON.parse(text));
+    const serialized = JSON.stringify(redacted);
+    // Bound the final size regardless of shape.
+    return serialized.length > 1000
+      ? `${serialized.slice(0, 1000)}…`
+      : serialized;
   } catch {
     // Non-JSON body (e.g. HTML gateway error) — truncate to avoid noise.
     return text.length > 500 ? `${text.slice(0, 500)}…` : text;
@@ -40,12 +55,14 @@ function redactErrorBody(text: string): string {
 
 /** Classify an HTTP status code into a SumUpErrorType. */
 function classifyStatus(status: number): SumUpErrorType {
-  if (status === 400 || status === 422) return "validation";
   if (status === 401 || status === 403) return "auth";
   if (status === 404) return "not_found";
   if (status === 409) return "conflict";
   if (status === 429) return "rate_limit";
-  return "server"; // 5xx and any other non-OK code
+  if (status >= 500) return "server";
+  // All other 4xx (400, 402, 405, 410, 422, …) are client errors: retrying
+  // won't help, so classify as non-retryable "validation" rather than "server".
+  return "validation";
 }
 
 /** Async sleep.  Resolves immediately when ms ≤ 0. */
@@ -90,6 +107,14 @@ export class SumUpClient {
   ): Promise<T> {
     let res: Response;
 
+    // Only idempotent methods may be auto-retried. Retrying a POST
+    // (createCheckout, refundTransaction) after a timeout / 5xx risks a
+    // DUPLICATE side effect — e.g. a second refund — because the first
+    // request may have been processed by SumUp before the response was
+    // lost. GET/DELETE can be safely replayed.
+    const method = (init.method ?? "GET").toUpperCase();
+    const isIdempotent = method === "GET" || method === "DELETE";
+
     // ── Network / timeout ──────────────────────────────────────────
     try {
       res = await fetch(url, {
@@ -102,7 +127,7 @@ export class SumUpClient {
         err?.name === "TimeoutError" || err?.name === "AbortError";
       const type: SumUpErrorType = isTimeout ? "timeout" : "network";
 
-      if (attempt < MAX_RETRIES) {
+      if (isIdempotent && attempt < MAX_RETRIES) {
         await sleep(backoffMs(attempt));
         return this.request<T>(url, init, attempt + 1);
       }
@@ -118,7 +143,20 @@ export class SumUpClient {
     // ── Success ────────────────────────────────────────────────────
     if (res.ok) {
       if (res.status === 204) return undefined as T;
-      return (await res.json()) as T;
+      // Some success responses (e.g. DELETE/refund) carry an empty or
+      // non-JSON body. Reading text first avoids res.json() throwing a raw
+      // SyntaxError that would escape our typed-error contract.
+      const text = await res.text().catch(() => "");
+      if (text.trim() === "") return undefined as T;
+      try {
+        return JSON.parse(text) as T;
+      } catch {
+        throw new SumUpClientError(
+          `SumUp returned a non-JSON success body (${res.status})`,
+          "server",
+          res.status,
+        );
+      }
     }
 
     // ── Error response ─────────────────────────────────────────────
@@ -126,7 +164,7 @@ export class SumUpClient {
     const type = classifyStatus(res.status);
     const isRetryable = type === "rate_limit" || type === "server";
 
-    if (isRetryable && attempt < MAX_RETRIES) {
+    if (isIdempotent && isRetryable && attempt < MAX_RETRIES) {
       const retryAfterHeader = res.headers.get("Retry-After");
       const retryAfterSec =
         retryAfterHeader != null

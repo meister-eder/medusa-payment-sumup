@@ -10,6 +10,13 @@ export type SumUpProviderOptions = {
   medusaUrl: string;
   /** Default redirect URL after 3DS / payment completion (storefront URL) */
   redirectUrl: string;
+  /**
+   * Hostnames (and optional ports) allowed when a request supplies a
+   * per-session `data.redirect_url`. Any override whose origin is not in this
+   * list — or, if this is omitted, not the same origin as `redirectUrl` — is
+   * rejected to prevent open-redirect abuse. Example: ["shop.example.com"].
+   */
+  redirectUrlAllowedHosts?: string[];
   /** Enable debug logging */
   debug?: boolean;
 };

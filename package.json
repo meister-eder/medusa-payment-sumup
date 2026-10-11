@@ -26,7 +26,7 @@
     ],
     "repository": {
         "type": "git",
-        "url": "https://github.com/meister-eder/medusa-payment-sumup.git"
+        "url": "git+https://github.com/meister-eder/medusa-payment-sumup.git"
     },
     "scripts": {
         "build": "medusa plugin:build",
